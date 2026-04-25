@@ -1,5 +1,7 @@
 # flyokai/amp-data-pipeline
 
+> User docs → [`README.md`](README.md) · Agent quick-ref → [`CLAUDE.md`](CLAUDE.md) · Agent deep dive → [`AGENTS.md`](AGENTS.md)
+
 Async data pipeline framework with composable stages, batch processing, and multicast distribution on AMPHP 3.x.
 
 See [AGENTS.md](AGENTS.md) for detailed documentation.
