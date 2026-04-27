@@ -2,6 +2,7 @@
 
 namespace Flyokai\AmpDataPipeline\DataCast;
 
+use Amp\Future;
 use Amp\Pipeline\ConcurrentIterator;
 use Amp\Pipeline\DisposedException;
 use Amp\Pipeline\Queue;
@@ -10,6 +11,7 @@ use Flyokai\AmpDataPipeline\DataItem\DataItem;
 use Flyokai\AmpDataPipeline\DataItem\DataItemImpl;
 use Flyokai\AmpDataPipeline\DataSource\IteratorSource;
 use function Amp\async;
+use function Amp\Future\awaitAll;
 use function Flyokai\AmpDataPipeline\errorDisposeQueue;
 
 class MultiCastConsumerImpl implements MultiCastConsumer
@@ -22,6 +24,10 @@ class MultiCastConsumerImpl implements MultiCastConsumer
      * @var \Closure(ConcurrentIterator):void
      */
     protected \Closure $releaseCastItems;
+    /**
+     * @var list<Future>
+     */
+    protected array $pendingFutures = [];
 
     public function __construct(
         protected CastProcessor $processor,
@@ -95,6 +101,20 @@ class MultiCastConsumerImpl implements MultiCastConsumer
             $queue = $this->queue;
             $source = $this->queue->iterate();
             $this->processor->cast($source, $this->acceptCastItem(...));
+            // Drain pendingFutures before returning. Each acceptCastItem call
+            // spawns an `async()` for processCastItems/releaseCastItems; if we
+            // return before they finish, MultiCastProcessor::read() proceeds
+            // to complete the outer queue while those microtasks are still
+            // pushing items to it — producing "Values cannot be enqueued
+            // after calling complete". The while-loop is required (not just a
+            // single awaitAll) because processCastItems may resume a fiber
+            // suspended in acceptCastItem (groupBufferSize backpressure),
+            // which then queues *more* pendingFutures.
+            while ($this->pendingFutures) {
+                $futures = $this->pendingFutures;
+                $this->pendingFutures = [];
+                awaitAll($futures);
+            }
         } catch (\Throwable $throwable) {
             $queue->error(new DisposedException(previous: $throwable));
             $source->dispose();
@@ -126,9 +146,9 @@ class MultiCastConsumerImpl implements MultiCastConsumer
             if (!$this->castResults->contains($origItem)) {
                 $this->castResults[$origItem] = new \SplObjectStorage();
             }
-            EventLoop::queue($this->processCastItems, $castProcessor, $origItem, $castItems);
+            $this->pendingFutures[] = async($this->processCastItems, $castProcessor, $origItem, $castItems);
         } else {
-            EventLoop::queue($this->releaseCastItems, $castItems);
+            $this->pendingFutures[] = async($this->releaseCastItems, $castItems);
         }
     }
 
