@@ -60,23 +60,49 @@ class BatchProcessor extends ProcessorAbstract
         $processor->reset();
         $processor->setSource(new QueueSource($queue))->setCancellation($this->cancellation);
         $futuresQueue = new Queue();
-        foreach ($processor as $resultItem) {
-            if ($handler->canHandle($resultItem)) {
-                $futuresQueue->pushAsync(
-                    $handler->handle($resultItem)
-                );
-            } elseif ($this->throwIfUnhadled) {
-                throw new \RuntimeException('DataItem handler not found');
+        $firstError = null;
+        try {
+            foreach ($processor as $resultItem) {
+                if ($handler->canHandle($resultItem)) {
+                    $futuresQueue->pushAsync(
+                        $handler->handle($resultItem)
+                    );
+                } elseif ($this->throwIfUnhadled) {
+                    throw new \RuntimeException('DataItem handler not found');
+                }
+            }
+        } catch (\Throwable $throwable) {
+            $firstError = $throwable;
+        } finally {
+            // Always complete and drain futuresQueue so handler futures
+            // pushed via pushAsync don't get destroyed unhandled. Each
+            // handler future may be `async(runHandler)` from
+            // HandlerComposition; if we throw out of consumeBatchQueue
+            // without awaiting them, they trigger UnhandledFutureError on
+            // destruction (commonly "Values cannot be enqueued after
+            // calling complete" when the underlying dispatcher writeQueue
+            // is closed). We drain them with per-future try/catch so one
+            // error doesn't abort draining of the rest.
+            if (!$futuresQueue->isComplete()) {
+                $futuresQueue->complete();
             }
         }
-        $futuresQueue->complete();
         $grouped = [];
         foreach (Future::iterate($futuresQueue->iterate()) as $index => $future) {
-            if ($this->groupResults) {
-                $grouped[] = $future->await();
-            } else {
-                $this->releaseDataItem($future->await());
+            try {
+                $value = $future->await();
+            } catch (\Throwable $throwable) {
+                $firstError ??= $throwable;
+                continue;
             }
+            if ($this->groupResults) {
+                $grouped[] = $value;
+            } else {
+                $this->releaseDataItem($value);
+            }
+        }
+        if ($firstError !== null) {
+            throw $firstError;
         }
         if ($this->groupResults) {
             $this->releaseDataItem(DataItemImpl::fromArray($grouped));

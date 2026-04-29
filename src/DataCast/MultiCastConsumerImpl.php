@@ -100,20 +100,25 @@ class MultiCastConsumerImpl implements MultiCastConsumer
         try {
             $queue = $this->queue;
             $source = $this->queue->iterate();
-            $this->processor->cast($source, $this->acceptCastItem(...));
-            // Drain pendingFutures before returning. Each acceptCastItem call
-            // spawns an `async()` for processCastItems/releaseCastItems; if we
-            // return before they finish, MultiCastProcessor::read() proceeds
-            // to complete the outer queue while those microtasks are still
-            // pushing items to it — producing "Values cannot be enqueued
-            // after calling complete". The while-loop is required (not just a
-            // single awaitAll) because processCastItems may resume a fiber
-            // suspended in acceptCastItem (groupBufferSize backpressure),
-            // which then queues *more* pendingFutures.
-            while ($this->pendingFutures) {
-                $futures = $this->pendingFutures;
-                $this->pendingFutures = [];
-                awaitAll($futures);
+            try {
+                $this->processor->cast($source, $this->acceptCastItem(...));
+            } finally {
+                // Drain pendingFutures unconditionally. Each acceptCastItem call
+                // spawns an `async()` for processCastItems/releaseCastItems; if
+                // we return before they finish, MultiCastProcessor::read()
+                // proceeds to complete the outer queue while those microtasks
+                // are still pushing items to it — producing "Values cannot be
+                // enqueued after calling complete". The while-loop is required
+                // (not just a single awaitAll) because processCastItems may
+                // resume a fiber suspended in acceptCastItem (groupBufferSize
+                // backpressure), which then queues *more* pendingFutures. The
+                // finally ensures pendingFutures are awaited even if cast()
+                // threw, so the futures don't trigger UnhandledFutureError.
+                while ($this->pendingFutures) {
+                    $futures = $this->pendingFutures;
+                    $this->pendingFutures = [];
+                    awaitAll($futures);
+                }
             }
         } catch (\Throwable $throwable) {
             $queue->error(new DisposedException(previous: $throwable));
